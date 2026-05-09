@@ -760,6 +760,8 @@ input,textarea,select{font:inherit;color:inherit;background:none;border:none;out
   </div>
   <div class="mact"><button class="btn btn-g" id="vc-cancel">Annuler</button><button class="btn btn-p" id="vc-ok">Enregistrer</button></div>
 </div></div>
+<!-- TAG MODAL -->
+<div class="ov" id="ov-tag"><div class="modal">
   <div class="modal-title">Nouveau tag</div>
   <div><div class="mlbl">Nom</div><input class="mi" id="mt-name" type="text" autocomplete="off"/></div>
   <div><div class="mlbl">Description</div><textarea class="mta" id="mt-desc" placeholder="Markdown…"></textarea></div>
@@ -1592,18 +1594,18 @@ function bindNodeDrag(el,node){
   el.querySelector('.node-port').addEventListener('mousedown',e=>{e.stopPropagation();const c=toCanvas(e.clientX,e.clientY);startConn(node.id,c.x,c.y);});
 }
 
-// TREE LAYOUT (Reingold-Tilford simplifié)
+// TREE LAYOUT
 function isTreeGraph(){ const g=_ag(); return g&&g.type==='tree'; }
 
 function applyTreeLayout(){
   const g=_ag(); if(!g||g.type!=='tree') return;
-  const nodes=S.nodes; const edges=S.edges;
+  const nodes=S.nodes, edges=S.edges;
   if(!nodes.length) return;
 
-  const H_GAP=220, V_GAP=140;
+  const H_GAP=200, V_GAP=150;
   const ids=nodes.map(n=>n.id);
 
-  // Build children & parents maps
+  // Build adjacency
   const children={}, parents={};
   ids.forEach(id=>{ children[id]=[]; parents[id]=[]; });
   edges.forEach(e=>{
@@ -1613,83 +1615,127 @@ function applyTreeLayout(){
     }
   });
 
-  // Topological sort (Kahn)
-  const inDeg={};
-  ids.forEach(id=>inDeg[id]=parents[id].length);
-  const q=ids.filter(id=>inDeg[id]===0), topo=[], vis=new Set(q);
-  while(q.length){
-    const cur=q.shift(); topo.push(cur);
-    children[cur].forEach(c=>{ inDeg[c]--; if(inDeg[c]<=0&&!vis.has(c)){vis.add(c);q.push(c);} });
-  }
-  ids.forEach(id=>{ if(!vis.has(id)) topo.push(id); });
+  // Find roots (no parents)
+  const roots=ids.filter(id=>parents[id].length===0);
 
-  // Depth = longest path from any root
+  // BFS to assign depth levels
   const depth={};
-  ids.forEach(id=>depth[id]=0);
-  topo.forEach(id=>children[id].forEach(c=>{ if(depth[id]+1>depth[c]) depth[c]=depth[id]+1; }));
+  ids.forEach(id=>depth[id]=-1);
+  const queue=[...roots];
+  roots.forEach(id=>depth[id]=0);
+  while(queue.length){
+    const cur=queue.shift();
+    children[cur].forEach(c=>{
+      if(depth[c]===-1){ depth[c]=depth[cur]+1; queue.push(c); }
+    });
+  }
+  // Nodes not reached (cycles or disconnected) — assign depth based on their own children BFS
+  ids.forEach(id=>{
+    if(depth[id]===-1) depth[id]=0;
+  });
 
   // Group by layer
   const layers={};
-  ids.forEach(id=>{ const d=depth[id]; if(!layers[d])layers[d]=[]; layers[d].push(id); });
+  ids.forEach(id=>{ const d=depth[id]; if(!layers[d]) layers[d]=[]; layers[d].push(id); });
   const maxDepth=Math.max(...Object.keys(layers).map(Number));
 
-  // Initial X: evenly spaced per layer
+  // Assign X positions using Reingold-Tilford inspired approach:
+  // For each subtree, compute width bottom-up, then assign X top-down
+  const subtreeW={};
   const posX={};
-  for(let d=0;d<=maxDepth;d++){
-    const layer=layers[d]||[];
-    layer.forEach((id,i)=>{ posX[id]=(i-(layer.length-1)/2)*H_GAP; });
+
+  // Compute subtree width (leaf=1, parent=sum of children widths)
+  // Process in reverse BFS order (leaves first)
+  const revTopo=[];
+  {
+    const visited=new Set();
+    const bfsQ=[...roots];
+    roots.forEach(r=>visited.add(r));
+    while(bfsQ.length){
+      const cur=bfsQ.shift();
+      revTopo.push(cur);
+      children[cur].forEach(c=>{ if(!visited.has(c)){ visited.add(c); bfsQ.push(c); } });
+    }
+    // Add any unvisited nodes
+    ids.forEach(id=>{ if(!visited.has(id)) revTopo.push(id); });
   }
 
-  // Spread a layer bidirectionally around ideal median, enforcing min H_GAP
-  function spreadLayer(layer){
-    if(layer.length<=1) return;
-    const idealMedian=layer.reduce((s,id)=>s+posX[id],0)/layer.length;
-    // Forward pass: push right
-    layer.sort((a,b)=>posX[a]-posX[b]);
-    for(let i=1;i<layer.length;i++){
-      if(posX[layer[i]]<posX[layer[i-1]]+H_GAP) posX[layer[i]]=posX[layer[i-1]]+H_GAP;
+  // Bottom-up subtree width
+  [...revTopo].reverse().forEach(id=>{
+    const ch=children[id].filter(c=>ids.includes(c));
+    if(ch.length===0){
+      subtreeW[id]=1;
+    } else {
+      subtreeW[id]=ch.reduce((s,c)=>s+(subtreeW[c]||1),0);
     }
-    // Backward pass: push left
-    for(let i=layer.length-2;i>=0;i--){
-      if(posX[layer[i]]>posX[layer[i+1]]-H_GAP) posX[layer[i]]=posX[layer[i+1]]-H_GAP;
-    }
-    // Re-center around ideal median
-    const actualMedian=layer.reduce((s,id)=>s+posX[id],0)/layer.length;
-    const shift=idealMedian-actualMedian;
-    layer.forEach(id=>posX[id]+=shift);
+  });
+
+  // BFS top-down to assign children
+  // For nodes with multiple parents, collect all proposed X and average them
+  const proposedX={};
+  ids.forEach(id=>{ proposedX[id]=[]; });
+  roots.forEach(r=>{ proposedX[r].push(posX[r]); });
+
+  // Process layer by layer so all parents are resolved before their children
+  const maxD=Math.max(...ids.map(id=>depth[id]));
+  // Build layers from depth map
+  const depthLayers={};
+  ids.forEach(id=>{ const d=depth[id]; if(!depthLayers[d]) depthLayers[d]=[]; depthLayers[d].push(id); });
+
+  // Give roots initial X positions spread evenly
+  const totalW=roots.reduce((s,r)=>s+(subtreeW[r]||1),0);
+  let cursor=-(totalW-1)/2;
+  roots.forEach(r=>{
+    posX[r]=cursor+(subtreeW[r]-1)/2;
+    proposedX[r]=[posX[r]];
+    cursor+=subtreeW[r];
+  });
+
+  // Layer 0 = roots already set
+  for(let d=0;d<=maxD;d++){
+    const layer=depthLayers[d]||[];
+    // First resolve this layer's posX from proposals
+    layer.forEach(id=>{
+      if(proposedX[id].length>0)
+        posX[id]=proposedX[id].reduce((s,x)=>s+x,0)/proposedX[id].length;
+    });
+    // Then distribute children of this layer
+    layer.forEach(cur=>{
+      const ch=children[cur].filter(c=>ids.includes(c));
+      if(!ch.length) return;
+      const totalCW=ch.reduce((s,c)=>s+(subtreeW[c]||1),0);
+      let cx=posX[cur]-(totalCW-1)/2;
+      ch.forEach(c=>{
+        proposedX[c].push(cx+(subtreeW[c]-1)/2);
+        cx+=subtreeW[c];
+      });
+    });
   }
 
-  // 8 refinement passes
-  for(let pass=0;pass<8;pass++){
-    // Top-down: pull children toward avg of their parents, then spread
-    for(let d=1;d<=maxDepth;d++){
-      const layer=[...(layers[d]||[])];
-      layer.forEach(id=>{ const ps=parents[id]; if(ps.length) posX[id]=ps.reduce((s,p)=>s+posX[p],0)/ps.length; });
-      spreadLayer(layer);
-    }
-    // Bottom-up: pull parents toward avg of their children, then spread
-    for(let d=maxDepth-1;d>=0;d--){
-      const layer=[...(layers[d]||[])];
-      layer.forEach(id=>{ const ch=children[id]; if(ch.length) posX[id]=ch.reduce((s,c)=>s+posX[c],0)/ch.length; });
-      spreadLayer(layer);
-    }
-  }
+  // Final resolve for any remaining nodes
+  ids.forEach(id=>{
+    if(proposedX[id].length>0)
+      posX[id]=proposedX[id].reduce((s,x)=>s+x,0)/proposedX[id].length;
+  });
 
-  // Global center
-  const allX=ids.map(id=>posX[id]);
-  const mid=(Math.min(...allX)+Math.max(...allX))/2;
-  ids.forEach(id=>posX[id]-=mid);
+  // Any unassigned node (disconnected) — place in a row at the bottom
+  const unassigned=ids.filter(id=>posX[id]===undefined);
+  unassigned.forEach((id,i)=>{
+    depth[id]=maxDepth+1;
+    posX[id]=i-(unassigned.length-1)/2;
+  });
 
-  // Apply
+  // Scale X by H_GAP and apply
   ids.forEach(id=>{
     const node=nodes.find(n=>n.id===id);
-    if(node) setNodePos(node, posX[id]+600, depth[id]*V_GAP+80);
+    if(node) setNodePos(node, posX[id]*H_GAP, depth[id]*V_GAP);
   });
 
   renderNodes();
+  renderEdges();
   setTimeout(centerAll,50);
   markDirty();
-  toast('DAG réorganisé ✓');
+  toast('Arbre réorganisé ✓');
 }
 
 /* Snap désactivé — positionnement libre jusqu'au clic Réorganiser */
